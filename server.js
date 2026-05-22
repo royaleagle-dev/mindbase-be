@@ -279,6 +279,10 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', time: Date.now() });
 });
 
-app.listen(PORT, () => {
+// app.listen(PORT, () => {
+//     console.log(`MindBase API running on port ${PORT}`);
+// });
+
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`MindBase API running on port ${PORT}`);
 });
