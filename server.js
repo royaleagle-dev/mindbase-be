@@ -1,69 +1,18 @@
-if (process.env.NODE_ENV !== 'production') {
-    require('dotenv').config();
-}
-
 const express = require('express');
-const mysql = require('mysql2/promise');
-const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { pool, authenticateToken, JWT_SECRET, createDefaultMap } = require('./db');
 
 const app = express();
-app.use(cors());
+app.use(require('cors')());
 app.use(express.json());
 
-// ─── Environment Variables ───────────────────────
-const JWT_SECRET = process.env.JWT_SECRET || 'mindbase-secret-key-change-in-production';
-const DB_HOST = process.env.DB_HOST || 'localhost';
-const DB_USER = process.env.DB_USER || 'root';
-const DB_PASSWORD = process.env.DB_PASSWORD || '';
-const DB_NAME = process.env.DB_NAME || 'mindbase';
 const PORT = process.env.PORT || 3001;
-
-// ─── MySQL Connection Pool ───────────────────────
-let pool = null;
-if(process.env.ONLINE == 'true'){
-    pool = mysql.createPool(process.env.MYSQL_URL);
-}else{
-    pool = mysql.createPool({
-        host: DB_HOST,
-        user: DB_USER,
-        password: DB_PASSWORD,
-        database: DB_NAME,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0
-    });
-}
-
-// ─── JWT Authentication Middleware ─────────────────
-const authenticateToken = async (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    
-    if (!token) {
-        return res.status(401).json({ error: 'Access token required' });
-    }
-    
-    try {
-        const jwt = require('jsonwebtoken');
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const [users] = await pool.query('SELECT id, username, email, display_name FROM users WHERE id = ?', [decoded.userId]);
-        if (users.length === 0) {
-            return res.status(401).json({ error: 'User not found' });
-        }
-        req.user = users[0];
-        next();
-    } catch (err) {
-        return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-};
 
 // ─── AUTH ROUTES ───────────────────────────────────
 
-// POST /api/auth/register
 app.post('/api/auth/register', async (req, res) => {
     const { username, email, password, displayName } = req.body;
-    const bcrypt = require('bcryptjs');
-    const jwt = require('jsonwebtoken');
     
     if (!username || !email || !password) {
         return res.status(400).json({ error: 'Username, email, and password are required' });
@@ -94,28 +43,23 @@ app.post('/api/auth/register', async (req, res) => {
             [username, email, hashedPassword, displayName || username]
         );
         
-        const token = jwt.sign({ userId: result.insertId }, JWT_SECRET, { expiresIn: '7d' });
+        const userId = result.insertId;
+        const mapId = await createDefaultMap(userId);
+        const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
         
         res.status(201).json({
             message: 'User registered successfully',
             token,
-            user: {
-                id: result.insertId,
-                username,
-                email,
-                displayName: displayName || username
-            }
+            user: { id: userId, username, email, displayName: displayName || username },
+            defaultMapId: mapId
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
-    const bcrypt = require('bcryptjs');
-    const jwt = require('jsonwebtoken');
     
     if (!email || !password) {
         return res.status(400).json({ error: 'Email and password are required' });
@@ -150,22 +94,98 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// GET /api/auth/me
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     res.json({ user: req.user });
 });
 
-// ─── PROTECTED NODE/EDGE ROUTES ────────────────────
+// ─── MAP ROUTES ────────────────────────────────────
 
-app.get('/api/data', authenticateToken, async (req, res) => {
+app.get('/api/maps', authenticateToken, async (req, res) => {
     try {
-        const [nodes] = await pool.query('SELECT * FROM nodes WHERE user_id = ?', [req.user.id]);
-        const [edges] = await pool.query(
-            `SELECT e.* FROM edges e 
-             JOIN nodes n ON e.source_id = n.id 
-             WHERE n.user_id = ?`,
+        const [maps] = await pool.query(
+            'SELECT id, name, created_at, updated_at FROM maps WHERE user_id = ? ORDER BY updated_at DESC',
             [req.user.id]
         );
+        res.json({ maps });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/maps', authenticateToken, async (req, res) => {
+    const { name } = req.body;
+    const mapName = name?.trim() || 'Untitled Map';
+    
+    try {
+        const [result] = await pool.query(
+            'INSERT INTO maps (user_id, name) VALUES (?, ?)',
+            [req.user.id, mapName]
+        );
+        res.status(201).json({
+            id: result.insertId,
+            name: mapName,
+            created_at: new Date(),
+            updated_at: new Date()
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/maps/:id', authenticateToken, async (req, res) => {
+    const { name } = req.body;
+    const mapId = parseInt(req.params.id);
+    
+    if (!name?.trim()) {
+        return res.status(400).json({ error: 'Map name is required' });
+    }
+    
+    try {
+        const [maps] = await pool.query('SELECT id FROM maps WHERE id = ? AND user_id = ?', [mapId, req.user.id]);
+        if (maps.length === 0) {
+            return res.status(403).json({ error: 'Unauthorized' });
+        }
+        
+        await pool.query('UPDATE maps SET name = ? WHERE id = ?', [name.trim(), mapId]);
+        res.json({ id: mapId, name: name.trim() });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/maps/:id', authenticateToken, async (req, res) => {
+    const mapId = parseInt(req.params.id);
+    
+    try {
+        const [maps] = await pool.query('SELECT id FROM maps WHERE id = ? AND user_id = ?', [mapId, req.user.id]);
+        if (maps.length === 0) {
+            return res.status(403).json({ error: 'Unauthorized' });
+        }
+        
+        // Cascade: edges and nodes deleted by foreign key constraints
+        await pool.query('DELETE FROM maps WHERE id = ?', [mapId]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── NODE/EDGE ROUTES (Map-scoped) ─────────────────
+
+app.get('/api/data', authenticateToken, async (req, res) => {
+    const mapId = parseInt(req.query.mapId);
+    if (!mapId) {
+        return res.status(400).json({ error: 'mapId query parameter required' });
+    }
+    
+    try {
+        const [mapCheck] = await pool.query('SELECT id FROM maps WHERE id = ? AND user_id = ?', [mapId, req.user.id]);
+        if (mapCheck.length === 0) {
+            return res.status(403).json({ error: 'Unauthorized or map not found' });
+        }
+        
+        const [nodes] = await pool.query('SELECT * FROM nodes WHERE map_id = ?', [mapId]);
+        const [edges] = await pool.query('SELECT * FROM edges WHERE map_id = ?', [mapId]);
         
         const formattedEdges = edges.map(e => ({
             id: `e${e.id}`,
@@ -187,11 +207,21 @@ app.get('/api/data', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/nodes', authenticateToken, async (req, res) => {
-    const { label, title, x, y } = req.body;
+    const { label, title, x, y, mapId } = req.body;
+    
+    if (!mapId) {
+        return res.status(400).json({ error: 'mapId is required' });
+    }
+    
     try {
+        const [mapCheck] = await pool.query('SELECT id FROM maps WHERE id = ? AND user_id = ?', [mapId, req.user.id]);
+        if (mapCheck.length === 0) {
+            return res.status(403).json({ error: 'Unauthorized' });
+        }
+        
         const [result] = await pool.query(
-            'INSERT INTO nodes (user_id, label, title, x, y) VALUES (?, ?, ?, ?, ?)',
-            [req.user.id, label, title || label, x, y]
+            'INSERT INTO nodes (user_id, map_id, label, title, x, y) VALUES (?, ?, ?, ?, ?, ?)',
+            [req.user.id, mapId, label, title || label, x, y]
         );
         res.json({
             id: result.insertId.toString(),
@@ -205,19 +235,24 @@ app.post('/api/nodes', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/edges', authenticateToken, async (req, res) => {
-    const { source, target } = req.body;
+    const { source, target, mapId } = req.body;
+    
+    if (!mapId) {
+        return res.status(400).json({ error: 'mapId is required' });
+    }
+    
     try {
         const [nodes] = await pool.query(
-            'SELECT id FROM nodes WHERE id IN (?, ?) AND user_id = ?',
-            [parseInt(source), parseInt(target), req.user.id]
+            'SELECT id FROM nodes WHERE id IN (?, ?) AND map_id = ? AND user_id = ?',
+            [parseInt(source), parseInt(target), mapId, req.user.id]
         );
         if (nodes.length !== 2) {
-            return res.status(403).json({ error: 'Unauthorized' });
+            return res.status(403).json({ error: 'Unauthorized or nodes not in map' });
         }
         
         const [result] = await pool.query(
-            'INSERT INTO edges (source_id, target_id) VALUES (?, ?)',
-            [parseInt(source), parseInt(target)]
+            'INSERT INTO edges (map_id, source_id, target_id) VALUES (?, ?, ?)',
+            [mapId, parseInt(source), parseInt(target)]
         );
         res.json({
             id: `e${result.insertId}`,
@@ -230,10 +265,14 @@ app.post('/api/edges', authenticateToken, async (req, res) => {
 });
 
 app.put('/api/nodes/:id/title', authenticateToken, async (req, res) => {
-    const { title } = req.body;
+    const { title, mapId } = req.body;
     const id = parseInt(req.params.id);
+    
     try {
-        const [nodes] = await pool.query('SELECT id FROM nodes WHERE id = ? AND user_id = ?', [id, req.user.id]);
+        const [nodes] = await pool.query(
+            'SELECT id FROM nodes WHERE id = ? AND map_id = ? AND user_id = ?',
+            [id, mapId, req.user.id]
+        );
         if (nodes.length === 0) {
             return res.status(403).json({ error: 'Unauthorized' });
         }
@@ -245,10 +284,14 @@ app.put('/api/nodes/:id/title', authenticateToken, async (req, res) => {
 });
 
 app.put('/api/nodes/:id/position', authenticateToken, async (req, res) => {
-    const { x, y } = req.body;
+    const { x, y, mapId } = req.body;
     const id = parseInt(req.params.id);
+    
     try {
-        const [nodes] = await pool.query('SELECT id FROM nodes WHERE id = ? AND user_id = ?', [id, req.user.id]);
+        const [nodes] = await pool.query(
+            'SELECT id FROM nodes WHERE id = ? AND map_id = ? AND user_id = ?',
+            [id, mapId, req.user.id]
+        );
         if (nodes.length === 0) {
             return res.status(403).json({ error: 'Unauthorized' });
         }
@@ -260,9 +303,14 @@ app.put('/api/nodes/:id/position', authenticateToken, async (req, res) => {
 });
 
 app.delete('/api/nodes/:id', authenticateToken, async (req, res) => {
+    const { mapId } = req.body;
     const id = parseInt(req.params.id);
+    
     try {
-        const [nodes] = await pool.query('SELECT id FROM nodes WHERE id = ? AND user_id = ?', [id, req.user.id]);
+        const [nodes] = await pool.query(
+            'SELECT id FROM nodes WHERE id = ? AND map_id = ? AND user_id = ?',
+            [id, mapId, req.user.id]
+        );
         if (nodes.length === 0) {
             return res.status(403).json({ error: 'Unauthorized' });
         }
@@ -279,15 +327,20 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', time: Date.now() });
 });
 
-// app.listen(PORT, () => {
-//     console.log(`MindBase API running on port ${PORT}`);
-// });
-
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`MindBase API running on port ${PORT}`);
-    console.log(`Binding to: 0.0.0.0:${PORT}`);
 });
 
 server.on('error', (err) => {
     console.error('Server error:', err);
 });
+
+
+// const server = app.listen(PORT, '0.0.0.0', () => {
+//     console.log(`MindBase API running on port ${PORT}`);
+//     console.log(`Binding to: 0.0.0.0:${PORT}`);
+// });
+
+// server.on('error', (err) => {
+//     console.error('Server error:', err);
+// });
