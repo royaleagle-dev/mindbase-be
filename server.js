@@ -283,6 +283,11 @@ app.get('/health', (req, res) => {
 //     console.log(`MindBase API running on port ${PORT}`);
 // });
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`MindBase API running on port ${PORT}`);
+    console.log(`Binding to: 0.0.0.0:${PORT}`);
+});
+
+server.on('error', (err) => {
+    console.error('Server error:', err);
 });
