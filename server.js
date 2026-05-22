@@ -1,25 +1,38 @@
+if (process.env.NODE_ENV !== 'production') {
+    require('dotenv').config();
+}
+
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ─── Environment Variables ───────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'mindbase-secret-key-change-in-production';
+const DB_HOST = process.env.DB_HOST || 'localhost';
+const DB_USER = process.env.DB_USER || 'root';
+const DB_PASSWORD = process.env.DB_PASSWORD || '';
+const DB_NAME = process.env.DB_NAME || 'mindbase';
+const PORT = process.env.PORT || 3001;
 
-// MySQL connection pool
-const pool = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: '',
-    database: 'mindbase',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
+// ─── MySQL Connection Pool ───────────────────────
+let pool = null;
+if(process.env.ONLINE == 'true'){
+    pool = mysql.createPool(process.env.MYSQL_URL);
+}else{
+    pool = mysql.createPool({
+        host: DB_HOST,
+        user: DB_USER,
+        password: DB_PASSWORD,
+        database: DB_NAME,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0
+    });
+}
 
 // ─── JWT Authentication Middleware ─────────────────
 const authenticateToken = async (req, res, next) => {
@@ -31,6 +44,7 @@ const authenticateToken = async (req, res, next) => {
     }
     
     try {
+        const jwt = require('jsonwebtoken');
         const decoded = jwt.verify(token, JWT_SECRET);
         const [users] = await pool.query('SELECT id, username, email, display_name FROM users WHERE id = ?', [decoded.userId]);
         if (users.length === 0) {
@@ -45,11 +59,12 @@ const authenticateToken = async (req, res, next) => {
 
 // ─── AUTH ROUTES ───────────────────────────────────
 
-// POST /api/auth/register - Register new user
+// POST /api/auth/register
 app.post('/api/auth/register', async (req, res) => {
     const { username, email, password, displayName } = req.body;
+    const bcrypt = require('bcryptjs');
+    const jwt = require('jsonwebtoken');
     
-    // Validation
     if (!username || !email || !password) {
         return res.status(400).json({ error: 'Username, email, and password are required' });
     }
@@ -65,7 +80,6 @@ app.post('/api/auth/register', async (req, res) => {
     }
     
     try {
-        // Check if username or email already exists
         const [existing] = await pool.query(
             'SELECT id FROM users WHERE username = ? OR email = ?',
             [username, email]
@@ -74,16 +88,12 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(409).json({ error: 'Username or email already taken' });
         }
         
-        // Hash password
         const hashedPassword = await bcrypt.hash(password, 12);
-        
-        // Insert user
         const [result] = await pool.query(
             'INSERT INTO users (username, email, password_hash, display_name) VALUES (?, ?, ?, ?)',
             [username, email, hashedPassword, displayName || username]
         );
         
-        // Generate JWT
         const token = jwt.sign({ userId: result.insertId }, JWT_SECRET, { expiresIn: '7d' });
         
         res.status(201).json({
@@ -101,9 +111,11 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-// POST /api/auth/login - Login user
+// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
+    const bcrypt = require('bcryptjs');
+    const jwt = require('jsonwebtoken');
     
     if (!email || !password) {
         return res.status(400).json({ error: 'Email and password are required' });
@@ -138,14 +150,13 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// GET /api/auth/me - Get current user
+// GET /api/auth/me
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     res.json({ user: req.user });
 });
 
 // ─── PROTECTED NODE/EDGE ROUTES ────────────────────
 
-// GET all nodes and edges for authenticated user
 app.get('/api/data', authenticateToken, async (req, res) => {
     try {
         const [nodes] = await pool.query('SELECT * FROM nodes WHERE user_id = ?', [req.user.id]);
@@ -175,7 +186,6 @@ app.get('/api/data', authenticateToken, async (req, res) => {
     }
 });
 
-// POST new node (user-scoped)
 app.post('/api/nodes', authenticateToken, async (req, res) => {
     const { label, title, x, y } = req.body;
     try {
@@ -194,11 +204,9 @@ app.post('/api/nodes', authenticateToken, async (req, res) => {
     }
 });
 
-// POST new edge
 app.post('/api/edges', authenticateToken, async (req, res) => {
     const { source, target } = req.body;
     try {
-        // Verify both nodes belong to the user
         const [nodes] = await pool.query(
             'SELECT id FROM nodes WHERE id IN (?, ?) AND user_id = ?',
             [parseInt(source), parseInt(target), req.user.id]
@@ -221,7 +229,6 @@ app.post('/api/edges', authenticateToken, async (req, res) => {
     }
 });
 
-// PUT update node title
 app.put('/api/nodes/:id/title', authenticateToken, async (req, res) => {
     const { title } = req.body;
     const id = parseInt(req.params.id);
@@ -237,7 +244,6 @@ app.put('/api/nodes/:id/title', authenticateToken, async (req, res) => {
     }
 });
 
-// Update node position after drag
 app.put('/api/nodes/:id/position', authenticateToken, async (req, res) => {
     const { x, y } = req.body;
     const id = parseInt(req.params.id);
@@ -253,7 +259,6 @@ app.put('/api/nodes/:id/position', authenticateToken, async (req, res) => {
     }
 });
 
-// Delete node and its edges
 app.delete('/api/nodes/:id', authenticateToken, async (req, res) => {
     const id = parseInt(req.params.id);
     try {
@@ -269,7 +274,11 @@ app.delete('/api/nodes/:id', authenticateToken, async (req, res) => {
     }
 });
 
-const PORT = 3001;
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', time: Date.now() });
+});
+
 app.listen(PORT, () => {
-    console.log(`MindBase API running on http://localhost:${PORT}`);
+    console.log(`MindBase API running on port ${PORT}`);
 });
